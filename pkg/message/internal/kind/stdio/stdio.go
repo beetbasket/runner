@@ -1,6 +1,8 @@
 package stdio
 
-import "github.com/beetbasket/runner/internal/kind"
+import (
+	"github.com/beetbasket/runner/pkg/message/internal/kind"
+)
 
 type (
 	Stderr = kind.Kind[stderr]
