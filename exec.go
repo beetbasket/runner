@@ -3,10 +3,10 @@ package runner
 import (
 	"context"
 	"fmt"
+	"github.com/beetbasket/runner/pkg/ipv4"
 	"github.com/beetbasket/runner/pkg/message"
 	"github.com/beetbasket/runner/pkg/message/input"
 	"github.com/beetbasket/runner/pkg/message/output"
-	"github.com/beetbasket/runner/pkg/stdionet"
 	"github.com/beetbasket/rx"
 	"github.com/google/uuid"
 	"github.com/point-c/wg"
@@ -53,7 +53,7 @@ func New(ctx context.Context, cmd CommandArgsEnv) (_ *Cmd, finalErr error) {
 		cancel:   cancel,
 		netstack: netstack,
 		prefix:   generatePrefix(),
-		address:  stdionet.GenerateRandomIPv4(),
+		address:  ipv4.GenerateRandomIPv4(),
 		wait:     make(chan struct{}),
 	}
 

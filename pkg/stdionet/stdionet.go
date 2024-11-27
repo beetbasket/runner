@@ -1,27 +1,32 @@
 package stdionet
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/binary"
 	"github.com/beetbasket/program/pkg/env"
+	"github.com/beetbasket/program/pkg/log"
+	"github.com/beetbasket/runner/pkg/ipv4"
 	"github.com/beetbasket/runner/pkg/matcher"
 	"github.com/beetbasket/runner/pkg/message/input"
 	"github.com/point-c/wg"
-	"github.com/point-c/wg/pkg/ipcheck"
+	"go.uber.org/fx"
 	"io"
 	"log/slog"
-	"math/rand"
 	"net"
 	"os"
 	"sync"
-	"time"
 )
 
-func init() {
-	env.RegisterParser[IPv4Parser]()
+func New() fx.Option {
+	return fx.Module("stdionet",
+		fx.Provide(
+			env.Unmarshal[Env],
+			fx.Private,
+		),
+		fx.Provide(
+			newStdionet,
+		),
+	)
 }
 
 type Env struct {
@@ -30,48 +35,66 @@ type Env struct {
 }
 
 type StdioNet struct {
-	env     Env
-	ns      *wg.Netstack
-	address net.IP
-	stdin   lockedBuf
+	env      Env
+	ns       *wg.Netstack
+	address  net.IP
+	stdin    lockedBuf
+	shutdown fx.Shutdowner
 }
 
-func Environment() (*StdioNet, error) {
-	sn := StdioNet{
-		env:     Env{},
-		ns:      must(wg.NewDefaultNetstack()),
-		address: GenerateRandomIPv4(),
-	}
-	if err := env.Unmarshal(&sn.env); err != nil {
+func newStdionet(
+	lf fx.Lifecycle,
+	shutdown fx.Shutdowner,
+	ev Env,
+	ctx context.Context,
+) (*StdioNet, error) {
+	ns, err := wg.NewDefaultNetstack()
+	if err != nil {
 		return nil, err
 	}
-	go sn.writePackets()
-	go sn.sortStdin()
+	lf.Append(fx.StopHook(func() error {
+		return ns.Close()
+	}))
+
+	sn := StdioNet{
+		ns:       ns,
+		address:  ipv4.GenerateRandomIPv4(),
+		env:      ev,
+		shutdown: shutdown,
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	lf.Append(fx.StartStopHook(func() {
+		go sn.writePackets(ctx)
+	}, cancel))
+	lf.Append(fx.StartStopHook(func() {
+		go sn.sortStdin(ctx)
+	}, cancel))
 	return &sn, nil
 }
 
-func (sn *StdioNet) sortStdin() {
-	var buf [wg.DefaultMTU * 2]byte
+func (sn *StdioNet) sortStdin(ctx context.Context) {
+	var buf [1000]byte
 	mm := matcher.New(sn.env.Prefix)
-	for {
+	for ctx.Err() == nil {
 		n, err := os.Stdin.Read(buf[:])
 		if err != nil {
 			slog.Error("failed to read from stdin", slog.Any("error", err))
 			return
 		}
-		mm.Write(buf[:n])
+		_, _ = mm.Write(buf[:n])
 
-		sn.stdin.Write(mm.ReadOut())
+		_, _ = sn.stdin.Write(mm.ReadOut())
 		if b := mm.ReadSpecial(); len(b) > 0 {
-			DecodePackets(sn.ns, b)
+			ipv4.DecodePackets(sn.ns, b)
 		}
 	}
 }
 
-func (sn *StdioNet) writePackets() {
+func (sn *StdioNet) writePackets(ctx context.Context) {
 	buf := [...][]byte{make([]byte, wg.DefaultMTU*2)}
 	var size [len(buf)]int
-	for {
+	for ctx.Err() == nil {
 		n, err := sn.ns.Read(buf[:], size[:], 0)
 		if err != nil {
 			slog.Error("error reading from netstack", slog.Any("error", err))
@@ -102,16 +125,13 @@ func (sn *StdioNet) Stdin() io.Reader {
 }
 
 func (sn *StdioNet) Exit(code ...int) {
-	if err := sn.ns.Close(); err != nil {
-		slog.Error("error closing netstack", slog.Any("error", err))
+	var opts []fx.ShutdownOption
+	if len(code) > 0 {
+		opts = append(opts, fx.ExitCode(code[0]))
 	}
 
-	time.Sleep(time.Second * 2)
-
-	if len(code) > 0 {
-		os.Exit(code[0])
-	} else {
-		os.Exit(0)
+	if err := sn.shutdown.Shutdown(opts...); err != nil {
+		slog.Error("failed to shutdown", log.Err(err))
 	}
 }
 
@@ -141,39 +161,6 @@ func (sn *StdioNet) Listen(port uint16) (net.Listener, error) {
 	})
 }
 
-type IPv4Parser struct {
-}
-
-func (IPv4Parser) Name() string {
-	return "ipv4"
-}
-
-func (IPv4Parser) Parse(s string) (net.IP, error) {
-	return net.ParseIP(s).To4(), nil
-}
-
-func GenerateRandomIPv4() net.IP {
-	var buf [4]byte
-	for {
-		binary.LittleEndian.PutUint32(buf[:], rand.Uint32())
-		ip := net.IPv4(buf[0], buf[1], buf[2], buf[3])
-		if !ipcheck.IsBogon(ip, ipcheck.IsPrivateNetwork) {
-			return ip.To4()
-		}
-	}
-}
-
-func must[T any](t T, err error) T {
-	check(err)
-	return t
-}
-
-func check(err error) {
-	if err != nil {
-		panic(err)
-	}
-}
-
 type lockedBuf struct {
 	buf  bytes.Buffer
 	lock sync.RWMutex
@@ -189,20 +176,4 @@ func (lb *lockedBuf) Write(b []byte) (int, error) {
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
 	return lb.buf.Write(b)
-}
-
-func DecodePackets(ns *wg.Netstack, b []byte) {
-	sc := bufio.NewScanner(bytes.NewReader(b))
-	for sc.Scan() {
-		b = bytes.TrimSpace(sc.Bytes())
-		if len(b) == 0 {
-			continue
-		}
-		db, err := base64.StdEncoding.AppendDecode(nil, b)
-		if err != nil {
-			slog.Error("failed to decode packet data", slog.String("data", string(b)))
-			continue
-		}
-		_, _ = ns.Write([][]byte{db}, 0)
-	}
 }

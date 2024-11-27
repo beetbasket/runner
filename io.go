@@ -2,11 +2,11 @@ package runner
 
 import (
 	"context"
+	"github.com/beetbasket/runner/pkg/ipv4"
 	"github.com/beetbasket/runner/pkg/matcher"
 	"github.com/beetbasket/runner/pkg/message"
 	"github.com/beetbasket/runner/pkg/message/input"
 	"github.com/beetbasket/runner/pkg/message/output"
-	"github.com/beetbasket/runner/pkg/stdionet"
 	"github.com/beetbasket/rx"
 	"github.com/point-c/wg"
 	"io"
@@ -45,7 +45,7 @@ func (kw *kindWriter[K]) Write(b []byte) (n int, _ error) {
 	}
 
 	if b := kw.matcher.ReadSpecial(); len(b) > 0 {
-		stdionet.DecodePackets(kw.netstack, b)
+		ipv4.DecodePackets(kw.netstack, b)
 	}
 	return len(b), nil
 }
